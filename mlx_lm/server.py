@@ -33,6 +33,7 @@ import mlx.core as mx
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
+from .disk_cache import DiskBackedPromptCache
 from .generate import (
     BatchGenerator,
     SequenceStateMachine,
@@ -1938,7 +1939,16 @@ def run(
     handler_class=APIHandler,
 ):
     group = mx.distributed.init()
-    prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
+    cache_dir = getattr(model_provider.cli_args, "prompt_cache_dir", None)
+    if cache_dir:
+        max_disk = getattr(model_provider.cli_args, "prompt_cache_disk_size", 100)
+        prompt_cache = DiskBackedPromptCache(
+            max_size=model_provider.cli_args.prompt_cache_size,
+            cache_dir=cache_dir,
+            max_disk_size=max_disk,
+        )
+    else:
+        prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
     response_generator = ResponseGenerator(model_provider, prompt_cache)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
@@ -2090,6 +2100,21 @@ def main():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--prompt-cache-dir",
+        type=str,
+        default=None,
+        help="Directory to persist prompt caches to disk. Survives server "
+        "restarts — cached prompts are restored from disk on cache miss. "
+        "Evicted caches are also saved here.",
+    )
+    parser.add_argument(
+        "--prompt-cache-disk-size",
+        type=int,
+        default=100,
+        help="Maximum number of disk cache entries (default: 100). "
+        "Independent of --prompt-cache-size which controls RAM entries.",
     )
     parser.add_argument(
         "--kv-cache-quantization",
