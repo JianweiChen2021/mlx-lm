@@ -143,6 +143,19 @@ def process_message_content(messages):
         elif content is None:
             message["content"] = ""
 
+        # Accept "reasoning" as an alias for "reasoning_content" on assistant
+        # messages. mlx_lm's responses emit `reasoning` (matches OpenAI's o1
+        # convention), but most chat templates (Qwen3, DeepSeek, ...) gate
+        # `<think>`/`reasoning_content` re-emission on `reasoning_content`.
+        # Without this bridge, clients that round-trip `reasoning` lose prior-turn
+        # thinking from the rendered prompt and the prompt cache misses.
+        if (
+            message.get("role") == "assistant"
+            and isinstance(message.get("reasoning"), str)
+            and not isinstance(message.get("reasoning_content"), str)
+        ):
+            message["reasoning_content"] = message["reasoning"]
+
         if tool_calls := message.get("tool_calls"):
             for tool_call in tool_calls:
                 if func := tool_call.get("function"):
@@ -545,6 +558,14 @@ class ResponseGenerator:
                 if args.chat_template_kwargs:
                     chat_template_args = chat_template_args.copy()
                     chat_template_args.update(args.chat_template_kwargs)
+                # Default preserve_thinking=True so chat templates that gate
+                # reasoning re-emission for prior assistant turns (e.g. Qwen3)
+                # keep reasoning in the rendered prompt for multi-turn cache
+                # alignment. Templates that ignore the kwarg are unaffected.
+                if "preserve_thinking" not in chat_template_args:
+                    if chat_template_args is self.model_provider.cli_args.chat_template_args:
+                        chat_template_args = chat_template_args.copy()
+                    chat_template_args["preserve_thinking"] = True
                 template_kwargs = dict(
                     tools=tools,
                     tokenize=True,
@@ -1147,6 +1168,39 @@ class APIHandler(BaseHTTPRequestHandler):
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             debug_body = json.dumps(self.body, indent="\t")
             logging.debug(f"Incoming Request Body: {debug_body}")
+        req_log_dir = getattr(
+            self.response_generator.cli_args, "request_log_dir", None
+        )
+        if req_log_dir:
+            try:
+                ts = time.time()
+                stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(ts))
+                ms = int((ts - int(ts)) * 1000)
+                rid = uuid.uuid4().hex[:8]
+                path = self.path.lstrip("/").replace("/", "_") or "root"
+                fname = f"{stamp}.{ms:03d}-{path}-{rid}.json"
+                out_dir = Path(req_log_dir).expanduser()
+                out_dir.mkdir(parents=True, exist_ok=True)
+                payload = {
+                    "timestamp": stamp,
+                    "timestamp_ms": ms,
+                    "epoch": ts,
+                    "method": self.command,
+                    "path": self.path,
+                    "client": (
+                        self.client_address[0]
+                        if isinstance(self.client_address, tuple)
+                        and self.client_address
+                        else None
+                    ),
+                    "content_length": content_length,
+                    "body": self.body,
+                }
+                with open(out_dir / fname, "w") as f:
+                    json.dump(payload, f, indent=2, ensure_ascii=False)
+                logging.info(f"Request body dumped to {out_dir / fname}")
+            except Exception as _e:
+                logging.warning(f"Request body dump failed: {_e}")
         if not isinstance(self.body, dict):
             debug_body = json.dumps(self.body, indent="\t")
             logging.error(f"Invalid Request Body: {debug_body}")
@@ -1451,8 +1505,15 @@ class APIHandler(BaseHTTPRequestHandler):
         token_logprobs = []
         top_tokens = []
 
+        _stats_t_start = time.perf_counter()
+        _stats_t_first: Optional[float] = None
+        _stats_t_last: Optional[float] = None
+
         try:
             for gen in response:
+                if _stats_t_first is None:
+                    _stats_t_first = time.perf_counter()
+                _stats_t_last = time.perf_counter()
                 logging.debug(gen.text)
 
                 # Collect the text according to our current state and state
@@ -1550,6 +1611,65 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
         finally:
             ctx.stop()
+            try:
+                prompt_total = len(ctx.prompt)
+                cached = (
+                    ctx.prompt_cache_count
+                    if ctx.prompt_cache_count is not None
+                    and ctx.prompt_cache_count >= 0
+                    else 0
+                )
+                uncached = max(prompt_total - cached, 0)
+                cached_pct = (100.0 * cached / prompt_total) if prompt_total else 0.0
+                gen_tokens = len(tokens)
+                ttft_s = (
+                    (_stats_t_first - _stats_t_start)
+                    if _stats_t_first is not None
+                    else None
+                )
+                decode_s = (
+                    (_stats_t_last - _stats_t_first)
+                    if (
+                        _stats_t_first is not None
+                        and _stats_t_last is not None
+                    )
+                    else None
+                )
+                total_s = (
+                    (_stats_t_last - _stats_t_start)
+                    if _stats_t_last is not None
+                    else None
+                )
+                prefill_tps = (
+                    (uncached / ttft_s)
+                    if (ttft_s and ttft_s > 0 and uncached > 0)
+                    else None
+                )
+                decode_tps = (
+                    ((gen_tokens - 1) / decode_s)
+                    if (decode_s and decode_s > 0 and gen_tokens > 1)
+                    else None
+                )
+                logging.info(
+                    "request_done id=%s model=%s prompt=%d cached=%d (%.1f%%) "
+                    "uncached=%d completion=%d finish=%s ttft=%s total=%s "
+                    "prefill_tps=%s decode_tps=%s stream=%s",
+                    self.request_id,
+                    self.requested_model,
+                    prompt_total,
+                    cached,
+                    cached_pct,
+                    uncached,
+                    gen_tokens,
+                    finish_reason,
+                    f"{ttft_s * 1000:.0f}ms" if ttft_s is not None else "-",
+                    f"{total_s * 1000:.0f}ms" if total_s is not None else "-",
+                    f"{prefill_tps:.1f}" if prefill_tps is not None else "-",
+                    f"{decode_tps:.1f}" if decode_tps is not None else "-",
+                    self.stream,
+                )
+            except Exception as _e:
+                logging.warning("request_done summary failed: %s", _e)
 
     def completion_usage_response(
         self,
@@ -1801,6 +1921,15 @@ def main():
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
         help="Set the logging level (default: INFO)",
+    )
+    parser.add_argument(
+        "--request-log-dir",
+        type=str,
+        default=None,
+        help=(
+            "If set, write each parsed request body to a timestamped JSON file "
+            "under this directory (auditing without DEBUG)."
+        ),
     )
     parser.add_argument(
         "--chat-template",
